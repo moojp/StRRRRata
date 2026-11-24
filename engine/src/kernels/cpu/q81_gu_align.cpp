@@ -19,7 +19,6 @@
 #include <atomic>
 #include <type_traits>
 namespace {
-#include "q81_gu_private/exact/guard_memo.hpp"
 namespace viewimpl {
 namespace C=strata::kernels::cpu;
 namespace q81math {
@@ -38,9 +37,8 @@ namespace A=q81math;
 struct InputView {
     std::span<const int8_t,2560> code;
     std::span<const float,80> scales;
-    uint64_t generation;
+    bool narrow22;
 };
-static_assert(sizeof(InputView)==3*sizeof(void*));
 #include "q81_gu_private/exact/exact8_view.hpp"
 
 template<int Type,int NT> void ranged(const C::NativeFmt& f,const uint8_t* b,const InputView* x,float* const* out,int r0,int r1){
@@ -57,9 +55,9 @@ template<int NT> void batch(const C::NativeFmt& f,const uint8_t* b,const void* c
     auto view=[&](int t){
         const auto address=(reinterpret_cast<uintptr_t>(raw[t])+31)&~uintptr_t(31);
         const auto* q=reinterpret_cast<const stockstyle::Input*>(address);
-        uint64_t generation=0;std::memcpy(&generation,(const uint8_t*)raw[t]+f.act_bytes-sizeof(generation),sizeof(generation));
-        A::require(generation!=0,"exact8 view needs quantized generation");
-        return InputView{q->code,q->scales,generation};
+        uint64_t state;std::memcpy(&state,(const uint8_t*)raw[t]+f.act_bytes-sizeof(state),sizeof(state));
+        A::require(state==1||state==2,"exact8 view needs quantized scratch");
+        return InputView{q->code,q->scales,state==2};
     };
     auto make=[&]<size_t... I>(std::index_sequence<I...>){return std::array<InputView,NT>{view(I)...};};
     const auto x=make(std::make_index_sequence<NT>{});
@@ -79,7 +77,7 @@ namespace stockstyle=viewimpl::stockstyle;
 } // namespace: private helpers cannot collide with test or other engine TUs.
 namespace strata::kernels::cpu {
 void q81_gu_quant(const NativeFmt& f,const float* x,void* dst){
-    quant5::wire<3>(f, x, dst);
+    quant5::wire(f, x, dst);
 }
 void q81_gu_rows(const NativeFmt& f,const uint8_t* blob,const void* const* act,int nt,float* const* out,int r0,int r1){
     viewimpl::A::require(f.n_embd==2560&&f.n_ff==640&&!f.had_gu&&!f.had_d&&f.act_bytes>=2880+31+8,"exact8 view geometry");

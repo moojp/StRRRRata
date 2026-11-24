@@ -90,12 +90,12 @@ template<int N> inline bool narrow22_codes(const int8_t* codes){
     return true;
 }
 template<int NT,class Input> inline bool can_narrow22(const Input* x){
-    auto scan=[&]{
-        for(int t=0;t<NT;++t)if(!narrow22_codes<2560>(x[t].code.data()))return false;
-        return true;
-    };
-    if constexpr(requires { x[0].generation; })return guardmemo::eligible<NT>(x,scan);
-    else return scan();
+    for(int t=0;t<NT;++t){
+        if constexpr(requires { x[t].narrow22; }){
+            if(!x[t].narrow22)return false;
+        }else if(!narrow22_codes<2560>(x[t].code.data()))return false;
+    }
+    return true;
 }
 template<int Type,bool Narrow22=false> inline __m256i pair_sum(__m256i a,__m256i b){
     if constexpr(Type==23)return _mm256_hadd_epi32(a,b);
@@ -124,16 +124,29 @@ template<int Type> inline void decode_group(const uint8_t* p,int j,int half,__m2
                           half_iq3xxs_grid[q[3]],half_iq3xxs_grid[q[2]],half_iq3xxs_grid[q[1]],half_iq3xxs_grid[q[0]]);
         const auto w=stockdecode::u32(p+66+8*j+4*half);
         sign=sign18(w);sc=stockdecode::sc32(2*int(w>>28)+1);
+    }else if constexpr(Type==22){
+        const int index=2*j+half;
+        const auto low=_mm_cvtsi32_si128(int32_t(stockdecode::u32(p+2+4*index)));
+        const auto high=_mm_cvtsi64_si128(int64_t(stockdecode::hi_spread.iq2s[p[66+index]]));
+        // Transfer all four indices together, then extract on the integer side.
+        const uint64_t grid_ids=uint64_t(_mm_cvtsi128_si64(_mm_unpacklo_epi8(low,high)));
+        g=_mm256_set_epi64x(int64_t(iq2s_grid[grid_ids>>48]),int64_t(iq2s_grid[uint16_t(grid_ids>>32)]),
+                           int64_t(iq2s_grid[uint16_t(grid_ids>>16)]),int64_t(iq2s_grid[uint16_t(grid_ids)]));
+        sign=stockdecode::sgn_vec_at(p+34+4*index);
+        sc=stockdecode::scale_vec(stockdecode::scale_vecs.s16[p[74+index]]);
     }else stockdecode::Fmt32<Type>::decode(p,j,half,g,sign,sc);
 }
 template<int Type> struct Coefficients {
-    __m256i low,high;float d;
+    __m256i low,high,first_scales,last_scales;float d;
     __attribute__((always_inline)) explicit Coefficients(const uint8_t* p):d(A::h2f(stockdecode::u16(p))){
         const auto one=_mm256_set1_epi32(1),mask=_mm256_set1_epi32(15);
         high=_mm256_setzero_si256();
         if constexpr(Type==18){
             auto v=_mm256_loadu_si256((const __m256i*)(p+66));
             low=_mm256_or_si256(_mm256_slli_epi32(_mm256_srli_epi32(v,28),1),one);
+            const auto paired=_mm256_or_si256(low,_mm256_slli_epi32(low,16));
+            first_scales=_mm256_permute2x128_si256(paired,paired,0x00);
+            last_scales=_mm256_permute2x128_si256(paired,paired,0x11);
         }
         if constexpr(Type==22){
             auto v=_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(p+74)));
@@ -156,8 +169,23 @@ template<int Type> struct Coefficients {
         __m256i lo,hi;if constexpr(Type==23)halves(partial,lo,hi);else halves16(partial,lo,hi);
         return finish_halves<false>(lo,hi);
     }
+    template<bool Narrow22>
+    __attribute__((always_inline)) __m256i weighted_quartet(__m256i a,__m256i b,bool last) const {
+        if constexpr(Type==18){
+            // Each int16 lane is an eight-code partial sum and is bounded
+            // by 8*31*127. The duplicated scale multiplies and widens two
+            // such lanes into a single int32, with no narrowing of their sum.
+            const auto scales=last ? last_scales : first_scales;
+            return _mm256_madd_epi16(_mm256_hadd_epi16(a,b),scales);
+        }else{
+            return quartet_sum<Type,Narrow22>(a,b);
+        }
+    }
     __attribute__((always_inline)) __m256i finish_packed(__m256i a,__m256i b) const {
-        return finish_halves<true>(_mm256_permute2x128_si256(a,b,0x20),_mm256_permute2x128_si256(a,b,0x31));
+        const auto lo=_mm256_permute2x128_si256(a,b,0x20);
+        const auto hi=_mm256_permute2x128_si256(a,b,0x31);
+        if constexpr(Type==18)return truncdiv<1>(_mm256_add_epi32(lo,hi));
+        else return finish_halves<true>(lo,hi);
     }
     template<bool Packed> __attribute__((always_inline)) __m256i finish_halves(__m256i lo,__m256i hi) const {
         auto sum=_mm256_add_epi32(lo,hi);
@@ -196,7 +224,7 @@ __attribute__((noinline)) void projection1_rows(const C::NativeFmt& f,const uint
                         if(which==0)first=value;else pairs[pair]=pair_sum<Type,Narrow22>(first,value);
                     }
                 }
-                quad[q]=quartet_sum<Type,Narrow22>(pairs[0],pairs[1]);
+                quad[q]=scale.template weighted_quartet<Narrow22>(pairs[0],pairs[1],q==1);
             }
             const int k=Ordered?b%4:0;auto dx=_mm256_load_ps(x[0].scales.data()+8*b);
             acc[k]=_mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(scale.d),dx),_mm256_cvtepi32_ps(scale.finish_packed(quad[0],quad[1])),acc[k]);
@@ -241,7 +269,7 @@ template<int Type,int NT,bool Ordered,bool Narrow22> void rows_impl(const C::Nat
                         }
                     }
                 }
-                for(int t=0;t<NT;++t){gquad[t][q]=quartet_sum<Type,Narrow22>(gp[t][0],gp[t][1]);uquad[t][q]=quartet_sum<Type,Narrow22>(up[t][0],up[t][1]);}
+                for(int t=0;t<NT;++t){gquad[t][q]=gs.template weighted_quartet<Narrow22>(gp[t][0],gp[t][1],q==1);uquad[t][q]=us.template weighted_quartet<Narrow22>(up[t][0],up[t][1],q==1);}
             }
             for(int t=0;t<NT;++t){
                 auto dx=_mm256_load_ps(x[t].scales.data()+8*b);const int k=Ordered?b%4:0;

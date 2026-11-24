@@ -1,7 +1,6 @@
 // Exact half-away rounding, not an approximate division or reciprocal.
 #pragma once
 #include <new>
-#include <atomic>
 namespace quant5 {
 inline __m256i round_half_away(__m256 mag){
     const auto nearest=_mm256_round_ps(mag,_MM_FROUND_TO_NEAREST_INT|_MM_FROUND_NO_EXC);
@@ -16,9 +15,10 @@ inline __m256i original_round(__m256 mag){
         _mm256_sub_ps(mag,fl),_mm256_set1_ps(.5f),_CMP_GE_OQ)),_mm256_set1_epi32(1));
     return _mm256_add_epi32(_mm256_cvttps_epi32(fl),inc);
 }
-template<class Input> inline void prepare(Input& a,const float* x,int n){
+template<class Input> inline bool prepare(Input& a,const float* x,int n,bool check_narrow){
     q81math::require(n==640||n==2560,"stockstyle activation geometry");
     const auto mask=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    auto max_norm=_mm256_setzero_si256();
     for(int k=0;k<n/32;++k){
         __m256 v[4],av[4];
         for(int j=0;j<4;++j){
@@ -43,14 +43,19 @@ template<class Input> inline void prepare(Input& a,const float* x,int n){
             p[j]=_mm_packs_epi32(_mm256_castsi256_si128(q),_mm256_extracti128_si256(q,1));
         }
         auto* dst=a.code.data()+32*k;
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst),_mm_packs_epi16(p[0],p[1]));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst+16),_mm_packs_epi16(p[2],p[3]));
+        const auto packed=_mm256_inserti128_si256(_mm256_castsi128_si256(_mm_packs_epi16(p[0],p[1])),
+                                                 _mm_packs_epi16(p[2],p[3]),1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst),packed);
+        if(check_narrow){
+            // Each eight-code sum is at most 1016, so its high 32 bits are zero.
+            const auto norm=_mm256_sad_epu8(_mm256_abs_epi8(packed),_mm256_setzero_si256());
+            max_norm=_mm256_max_epu32(max_norm,norm);
+        }
     }
+    return check_narrow && !_mm256_movemask_epi8(_mm256_cmpgt_epi64(max_norm,_mm256_set1_epi64x(762)));
 }
-inline std::atomic<uint64_t> generation{1};
-template<int Mode> __attribute__((noinline)) void wire(
+__attribute__((noinline)) inline void wire(
     const strata::kernels::cpu::NativeFmt& f,const float* x,void* dst){
-    static_assert(Mode>=1&&Mode<=3);
     constexpr size_t Wire=2880;
     q81math::require(f.n_embd==2560&&f.n_ff==640&&!f.had_gu&&!f.had_d&&
         f.act_bytes>=Wire+31+8,"Q81 gate/up: unsupported geometry or scratch size");
@@ -61,20 +66,23 @@ template<int Mode> __attribute__((noinline)) void wire(
     // also supports overlapping source/output, so preserve that behavior.
     const bool overlap=dst_address>=src_address?dst_address-src_address<2560*sizeof(float)
         :src_address-dst_address<f.act_bytes;
-    if(Mode==3&&!overlap){
+    const bool check_narrow=f.gu_type==22;
+    bool narrow;
+    if(!overlap){
         // Start a fresh implicit-lifetime aggregate in the aligned wire. No
         // persistent pointer/cache; all code/scale elements are assigned.
         auto* q=::new(static_cast<void*>(aligned)) stockstyle::Input;
-        prepare(*q,x,2560);
+        narrow=prepare(*q,x,2560,check_narrow);
         std::memset(raw,0,size_t(aligned-raw));
         std::memset(aligned+Wire,0,f.act_bytes-size_t(aligned-raw)-Wire);
     }else{
         stockstyle::Input q;
-        if constexpr(Mode==1)stockstyle::prepare(q,x,2560);else prepare(q,x,2560);
+        narrow=prepare(q,x,2560,check_narrow);
         std::memset(raw,0,f.act_bytes);std::memcpy(aligned,&q,Wire);
     }
-    const auto g=generation.fetch_add(1,std::memory_order_relaxed);
-    q81math::require(g!=0,"Q81 generation counter exhausted");
-    std::memcpy(raw+f.act_bytes-8,&g,8);
+    // Workers read immutable scratch after it is published by the pool.
+    // Zero still identifies scratch that has not been quantized.
+    const uint64_t state=narrow ? 2 : 1;
+    std::memcpy(raw+f.act_bytes-sizeof(state),&state,sizeof(state));
 }
 }

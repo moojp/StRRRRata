@@ -17,7 +17,6 @@
 #include <span>
 #include <stdexcept>
 namespace {
-#include "q81_gu_private/exact/guard_memo.hpp"
 namespace consumeimpl {
 namespace C=strata::kernels::cpu;
 namespace q81math {
@@ -32,17 +31,16 @@ inline float reduce8(__m256 x){
 }
 #include "q81_gu_private/stock_style.hpp"
 namespace A=q81math;
-struct InputView {std::span<const int8_t,2560> code;std::span<const float,80> scales;uint64_t generation;};
-static_assert(sizeof(InputView)==3*sizeof(void*));
+struct InputView {std::span<const int8_t,2560> code;std::span<const float,80> scales;bool narrow22;};
 static_assert(offsetof(stockstyle::Input,scales)==2560);
 #include "q81_gu_private/exact/gu_consume.hpp"
 template<int NT> void batch(const C::NativeFmt& f,const uint8_t* blob,const void* const* raw,float* const* out,int r0,int r1){
     auto view=[&](int t){
         const auto address=(reinterpret_cast<uintptr_t>(raw[t])+31)&~uintptr_t(31);
-        uint64_t generation;std::memcpy(&generation,(const uint8_t*)raw[t]+f.act_bytes-8,8);
-        A::require(generation!=0,"exact GU consume needs quantized generation");
+        uint64_t state;std::memcpy(&state,(const uint8_t*)raw[t]+f.act_bytes-sizeof(state),sizeof(state));
+        A::require(state==1||state==2,"exact GU consume needs quantized scratch");
         return InputView{std::span<const int8_t,2560>(reinterpret_cast<const int8_t*>(address),2560),
-            std::span<const float,80>(reinterpret_cast<const float*>(address+2560),80),generation};
+            std::span<const float,80>(reinterpret_cast<const float*>(address+2560),80),state==2};
     };
     auto make=[&]<size_t... I>(std::index_sequence<I...>){return std::array<InputView,NT>{view(I)...};};
     const auto x=make(std::make_index_sequence<NT>{});
