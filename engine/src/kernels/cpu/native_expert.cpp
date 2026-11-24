@@ -3,6 +3,9 @@
 // while retaining shared weight decoding where the grouped kernel gives the same result.
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/quant/dot_x4_policy.hpp"
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+#include "strata/kernels/cpu/q81_gu_align.hpp"
+#endif
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
@@ -28,12 +31,63 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace strata::kernels::cpu {
 namespace {
 
 using namespace pq;   // Tr, traits(), row_size_of(), blck_size_of(), flavour_*(), layer_init(), kTQ8_0 ... (pool_quant.hpp)
+
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+bool q81_gu_requested(){
+    static const bool on=[] {
+        const char* v=std::getenv("STRATA_CPU_Q81_GU_ALIGN");
+        if(!v||!v[0]||std::strcmp(v,"0")==0)return false;
+        if(std::strcmp(v,"1")!=0)throw std::runtime_error("STRATA_CPU_Q81_GU_ALIGN expects 0 or 1");
+        if(!cpu_avx2_ok())throw std::runtime_error("STRATA_CPU_Q81_GU_ALIGN requires AVX2/FMA/F16C");
+        return true;
+    }();return on;
+}
+bool q81_gu_for(const NativeFmt& f){
+    return q81_gu_requested()&&f.n_embd==2560&&f.n_ff==640&&!f.had_gu&&!f.had_d&&f.act_bytes>=2919&&
+        (f.gu_type==18||f.gu_type==21||f.gu_type==22||f.gu_type==23);
+}
+bool q81_down_requested(){
+    static const bool on=[] {
+        const char* v=std::getenv("STRATA_CPU_DOWN_REUSE");
+        if(!v||!v[0]||std::strcmp(v,"0")==0)return false;
+        if(std::strcmp(v,"1")!=0)throw std::runtime_error("STRATA_CPU_DOWN_REUSE expects 0 or 1");
+        if(!cpu_avx2_ok())throw std::runtime_error("STRATA_CPU_DOWN_REUSE requires AVX2/FMA/F16C");
+        return true;
+    }();return on;
+}
+bool q81_down_overridden(){
+    // Original native feature decisions are process-immutable too. Preserve
+    // presence semantics: even an explicit zero override uses original code.
+    static const bool overridden=std::getenv("STRATA_NO_IQ4NL")!=nullptr||
+        std::getenv("STRATA_IQ_MT_MIN")!=nullptr||std::getenv("STRATA_IQ_PREFETCH")!=nullptr;
+    return overridden;
+}
+bool q81_down_order_requested(){
+    static const bool on=[] {
+        const char* value=std::getenv("STRATA_CPU_Q81_DOWN_ORDER");
+        if(!value||!value[0]||std::strcmp(value,"0")==0)return false;
+        if(std::strcmp(value,"1")!=0)throw std::runtime_error("STRATA_CPU_Q81_DOWN_ORDER expects 0 or 1");
+        if(!cpu_avx2_ok())throw std::runtime_error("STRATA_CPU_Q81_DOWN_ORDER requires AVX2/FMA/F16C");
+        return true;
+    }();return on;
+}
+bool q81_down_batch_requested(){
+    static const bool on=[] {
+        const char* v=std::getenv("STRATA_CPU_DOWN_BATCH_REUSE");
+        if(v==nullptr||std::strcmp(v,"0")==0)return false;
+        if(std::strcmp(v,"1")!=0)throw std::runtime_error("STRATA_CPU_DOWN_BATCH_REUSE expects 0 or 1");
+        if(!cpu_avx2_ok())throw std::runtime_error("STRATA_CPU_DOWN_BATCH_REUSE requires AVX2/FMA/F16C");
+        return true;
+    }();return on;
+}
+#endif
 
 // Do the trellis rows take Strata's own kernels (tq_cpu.hpp)?  Always, unless STRATA_NO_TQ_KERNELS=1 asks for ggml-cpu's
 // vec_dot AND this ggml has the type (the agentionai fork; an upstream ggml does not, and must never be asked about it).
@@ -361,6 +415,11 @@ bool kq512_ok(int type) {
 }  // namespace
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    (void)q81_gu_requested();   // validate opt-in setting before accepting requests
+    (void)q81_down_order_requested();
+    (void)q81_down_requested();
+#endif
     init_once();
     // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
     // type table by the id, so asking it about 144 reads past the table): their geometry and activation format (Q8_0)
@@ -512,6 +571,9 @@ void act_dump_record(int layer, int kind, const float* v, int64_t n) {
 }  // namespace
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    if(q81_gu_for(f)){q81_gu_quant(f,x,dst);return;}
+#endif
     if (f.had_gu) {   // Hadamard-folded gate/up: quantize H (s * x), never x itself (hadamard.hpp)
         thread_local std::vector<float> tmp;
         tmp.assign(x, x + f.n_embd);
@@ -559,6 +621,12 @@ int native_gu_mt_min(int gu_type) {
 template <NativeArithmetic Arithmetic>
 void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    if(q81_gu_for(f)){
+        if(q81_gu_consume_rows(f,blob,act,nt,ff,r0,r1))return;
+        q81_gu_rows(f,blob,act,nt,ff,r0,r1);return;
+    }
+#endif
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -902,6 +970,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt,
                       float* const* out, int r0, int r1) {
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    if(q81_down_order_requested()&&!q81_down_overridden()&&
+       q81_gpu_down_rows(f,blob,hq,nt,out,r0,r1))return;
+    if(q81_down_requested()&&!q81_down_overridden()&&
+       q81_down_reuse_rows(f,blob,hq,nt,out,r0,r1))return;
+#endif
     native_down_rows_impl<NativeArithmetic::Default>(f, blob, hq, nt, out, r0, r1);
 }
 
@@ -915,4 +989,28 @@ void native_down_rows_invariant(const NativeFmt& f, const uint8_t* blob, const v
     native_down_rows_impl<NativeArithmetic::WindowInvariant>(f, blob, hq, nt, out, r0, r1);
 }
 
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+bool native_down_gpu_order_enabled() {
+    return q81_down_order_requested() && !q81_down_overridden();
+}
+bool native_down_prepared_rows(const NativeFmt& f, const uint8_t* blob, const Q81DownPrepared& prepared,
+                               int nt, float* const* out, int r0, int r1) {
+    if (native_down_gpu_order_enabled())
+        return q81_gpu_down_prepared_rows(f, blob, prepared, nt, out, r0, r1);
+    return q81_down_prepared_rows(f, blob, prepared, nt, out, r0, r1);
+}
+bool native_down_batch_reuse_enabled() {
+    return q81_down_batch_requested();
+}
+bool native_prepare_down_batch(const NativeFmt& f, const void* const* hq, int nt,
+                               NativeArithmetic arithmetic, Q81DownPrepared& prepared) {
+    prepared.ready = false;
+    prepared.nt = 0;
+    if (arithmetic != NativeArithmetic::Default || !q81_down_batch_requested() || q81_down_overridden())
+        return false;
+    if (q81_down_order_requested()) return q81_gpu_down_prepare(f, hq, nt, prepared);
+    if (!q81_down_requested()) return false;
+    return q81_down_prepare(f, hq, nt, prepared);
+}
+#endif
 }  // namespace strata::kernels::cpu

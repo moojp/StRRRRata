@@ -1,6 +1,10 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+#include "strata/kernels/cpu/q81_gu_align.hpp"
+#include <stdexcept>
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -483,6 +487,20 @@ void act_quant_any(const float* x, int n, ActQ& a) {
     if (cpu_vnni_ok()) act_quant_q8_1(x, n, a);
     else if (cpu_avx2_ok()) act_quant_q8_1_avx2(x, n, a);
     else act_quant_q8_1_avx1(x, n, a);   // issue #1699
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    // Only the640-value Q2_0 down image. Gate/up and other geometries keep
+    // their release contract; the option is independent and defaultOFF.
+    if(n==640){
+        static const bool align=[] {
+            const char* value=std::getenv("STRATA_CPU_Q81_Q2_DOWN_SCALE");
+            if(!value||!value[0]||std::strcmp(value,"0")==0)return false;
+            if(std::strcmp(value,"1")!=0)throw std::runtime_error("STRATA_CPU_Q81_Q2_DOWN_SCALE expects 0 or 1");
+            if(!cpu_avx2_ok())throw std::runtime_error("STRATA_CPU_Q81_Q2_DOWN_SCALE requires AVX2/F16C");
+            return true;
+        }();
+        if(align)q81_q2_down_scales(a);
+    }
+#endif
 }
 
 #if !defined(STRATA_NATIVE_EXPERTS)

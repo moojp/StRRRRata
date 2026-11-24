@@ -305,6 +305,19 @@ macro(strata_cpu_native_experts)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
+  if(STRATA_BUILD_CPU_EXPERT_ALIGNMENT)
+    set(_strata_alignment_avx2_sources
+        src/kernels/cpu/gpu_down_order.cpp
+        src/kernels/cpu/gu_consume.cpp
+        src/kernels/cpu/q2_down_scales.cpp
+        src/kernels/cpu/q81_gu_align.cpp)
+    target_sources(strata_kernels_cpu PRIVATE ${_strata_alignment_avx2_sources})
+    # ExpertPool is visible to engine callers, which must see its same layout.
+    target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_Q81_GU_ALIGN_BUILT=1)
+    set_source_files_properties(${_strata_alignment_avx2_sources} PROPERTIES
+        COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-fno-fast-math;-ffp-contract=off")
+    unset(_strata_alignment_avx2_sources)
+  endif()
   if(STRATA_CPU_X86)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
                                              src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx512.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp

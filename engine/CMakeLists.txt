@@ -182,6 +182,13 @@ option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 # token gates identical).  arm64 was OFF until the gate/up loop's store-forwarding stall was fixed (OWN-2N2); the Spark pool decode then measured
 # 0.992 of ggml's over 18 interleaved pairs.  -DSTRATA_OWN_CPU_QUANT=OFF builds the ggml-cpu pool.
 option(STRATA_OWN_CPU_QUANT "CPU expert pool on the Strata quant layer (src/quant) instead of ggml-cpu's type traits" ON)
+option(STRATA_BUILD_CPU_EXPERT_ALIGNMENT "Build experimental CPU/GPU expert alignment (Linux x86-64 with GCC)" OFF)
+if(STRATA_BUILD_CPU_EXPERT_ALIGNMENT AND
+   (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$" OR
+    NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR
+    NOT STRATA_NATIVE_EXPERTS OR NOT STRATA_OWN_CPU_QUANT OR STRATA_ENABLE_SYCL))
+  message(FATAL_ERROR "CPU expert alignment requires Linux x86-64, GCC and the native Strata CPU quant layer")
+endif()
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()

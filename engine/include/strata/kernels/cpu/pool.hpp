@@ -29,6 +29,9 @@
 
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+#include "strata/kernels/cpu/q81_gu_align.hpp"
+#endif
 #include "strata/kernels/cpu/pool_plan.hpp"
 
 #include <atomic>
@@ -447,11 +450,18 @@ private:
     struct alignas(64) DepExpert {
         std::atomic<int32_t> gu_left{0};
         std::atomic<int32_t> quant{0};
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+        std::unique_ptr<Q81DownPrepared> prepared;
+#endif
     };
     std::unique_ptr<DepExpert[]> dep_;   // kMaxSplitMulti
     bool dep_on_ = true;                 // STRATA_POOL_DEP, read once in the constructor
     int dep_nb_ = 0, dep_k_gu_ = 1, dep_k_dn_ = 1;   // the current batch: experts, gate/up tasks per expert, down tasks per expert
     void dep_task(int i);
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    static_assert(sizeof(DepExpert) == 64, "preserve dependency state stride");
+    void prepare_batch_down(int e);
+#endif
     // Diagnostic (STRATA_DIAG_POOL=1, a measuring build only): where the time of run_split_multi_native goes.
     struct alignas(64) DiagW {
         std::atomic<int64_t> busy{0}, wake{0}, tasks{0};

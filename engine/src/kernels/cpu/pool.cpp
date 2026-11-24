@@ -919,6 +919,12 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
     dep_.reset(new DepExpert[(size_t) kMaxSplitMulti]);
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    if (native_down_batch_reuse_enabled()) {
+        for (int e = 0; e < kMaxSplitMulti; ++e)
+            dep_[(size_t) e].prepared = std::make_unique<Q81DownPrepared>();
+    }
+#endif
     // STRATA_POOL_DEP: ON unless "0" (0.1.63: bit-exact, window -2.9%; =0 is the way back to the two-phase batch)
     dep_on_ = [] { const char* v = std::getenv("STRATA_POOL_DEP"); return v == nullptr || v[0] != '0'; }();
     // STRATA_NUMA_SPLIT: decided here, before any worker starts (a worker counts into its slice's `parked` from its
@@ -1294,6 +1300,13 @@ void ExpertPool::native_rows(int e, int r0, int r1) {
             native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
         else
             native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    } else if (const auto& prepared = dep_[(size_t) e].prepared;
+               prepared && prepared->ready &&
+               native_down_prepared_rows(*nfmt, mjobs_[e].blob, *prepared,
+                                         mjobs_[e].nt, mjobs_[e].out, r0, r1)) {
+        // The host published the snapshot after quantizing all hidden rows.
+#endif
     } else if (q2_native_kernels(nfmt->d_type)) {
         // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
         const ActQ* a2[MAXT];
@@ -1438,6 +1451,9 @@ void ExpertPool::dep_task(int i) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
     if (d.quant.compare_exchange_strong(expect, 1, std::memory_order_acquire)) {
         for (int t = 0; t < mjobs_[e].nt; ++t) native_quant_h(f, sb.ff[t], sb.hq[t]);
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+        prepare_batch_down(e); // visible together with hq after quant.store(release)
+#endif
         d.quant.store(2, std::memory_order_release);
     } else {
         while (d.quant.load(std::memory_order_acquire) != 2) strata_cpu_pause();
@@ -1447,11 +1463,27 @@ void ExpertPool::dep_task(int i) {
     const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;
     const void* hq[MAXT];
     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    if (d.prepared && d.prepared->ready &&
+        native_down_prepared_rows(*nfmt, mjobs_[e].blob, *d.prepared, mjobs_[e].nt, mjobs_[e].out, r0, r1))
+        return;
+#endif
     if (narithmetic_ == NativeArithmetic::WindowInvariant)
         native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
     else
         native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
 }
+
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+void ExpertPool::prepare_batch_down(int e) {
+    auto* prepared = dep_[(size_t) e].prepared.get();
+    if (prepared == nullptr) return;
+    const void* hq[MAXT];
+    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = split_multi_[(size_t) e].hq[t];
+    const NativeFmt& fmt = mjobs_[e].fmt ? *mjobs_[e].fmt : *nfmt_;
+    native_prepare_down_batch(fmt, hq, mjobs_[e].nt, narithmetic_, *prepared);
+}
+#endif
 
 void ExpertPool::run_range(int n_tasks, void (*fn)(void*, int), void* ctx) {
     if (n_tasks <= 0 || fn == nullptr) return;
@@ -1565,6 +1597,13 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         narithmetic_ = arithmetic;
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+        // Previous run_phase returned only after every consumer completed and
+        // parked. Late empty epoch claims cannot touch a snapshot. Invalidate
+        // EVERY batch, including unsupported or WindowInvariant fallbacks.
+        for (int e = 0; e < nb; ++e)
+            if (auto& prepared = dep_[(size_t) e].prepared) prepared->ready = false;
+#endif
         if (dep_on_ && !static_slices_ && numa_n_ == 0 && n_ > 1 && !q2_native_kernels(f.gu_type) && !q2_native_kernels(f.d_type)) {
             // BW-G (STRATA_POOL_DEP=1): the whole layer call as one batch, no barrier between the phases (DepExpert, pool.hpp)
             const int per_phase = phase_tasks((int64_t) nb * f.n_ff);
@@ -1591,6 +1630,9 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
             for (int t = 0; t < mjobs_[e].nt; ++t)
                 if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+        for (int e = 0; e < nb; ++e) prepare_batch_down(e);
+#endif
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = static_slices_ ? n_ : numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);
