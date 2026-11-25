@@ -22,14 +22,19 @@ struct Prepared {
     }
 };
 inline __m256 group4(const uint8_t* row,const Prepared& x,int block,__m256 accumulator){
-    const auto table=_mm_loadu_si128(reinterpret_cast<const __m128i*>(values));
-    const auto mask=_mm_set1_epi8(15);const auto one=_mm256_set1_epi16(1);
+    // Duplicate the packed bytes into both lanes, then select low nibbles
+    // in the first lane and high nibbles in the second for one table lookup.
+    const auto table = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(values)));
+    const auto shifts = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);
+    const auto mask = _mm256_set1_epi8(15);
+    const auto one = _mm256_set1_epi16(1);
     __m256i p[4];
     for(int j=0;j<4;++j){
-        const auto* weight=row+18*(block+j);const auto packed=_mm_loadu_si128(reinterpret_cast<const __m128i*>(weight+2));
-        const auto low=_mm_shuffle_epi8(table,_mm_and_si128(packed,mask));
-        const auto high=_mm_shuffle_epi8(table,_mm_and_si128(_mm_srli_epi16(packed,4),mask));
-        const auto w=_mm256_inserti128_si256(_mm256_castsi128_si256(low),high,1);
+        const auto* weight = row + 18 * (block + j);
+        const auto bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weight + 2));
+        const auto packed = _mm256_broadcastsi128_si256(bytes);
+        const auto indices = _mm256_and_si256(_mm256_srlv_epi32(packed, shifts), mask);
+        const auto w = _mm256_shuffle_epi8(table, indices);
         const auto q=_mm256_load_si256(reinterpret_cast<const __m256i*>(x.code[block+j]));
         p[j]=_mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_abs_epi8(w),_mm256_sign_epi8(q,w)),one);
     }
