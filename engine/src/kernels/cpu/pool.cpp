@@ -1,4 +1,6 @@
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
+#include "strata/kernels/iq4nl_hidden_residual.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -1277,6 +1279,49 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
+namespace {
+bool residual_for(const NativeFmt& f) {
+    return iq4nl_hidden_residual_enabled() && f.d_type == 20 && f.d_act == 8 &&
+           f.n_ff == 640 && f.n_embd == 2560 && !f.had_d && !f.tail_off;
+}
+
+void quantize_pool_hidden(const NativeFmt& f, float* hidden, uint8_t* primary) {
+    native_quant_h(f, hidden, primary);
+    if (!residual_for(f)) return;
+
+    // After gate/up the float scratch can hold the second quantized row.
+    static_assert(640 * sizeof(float) >= kNativeHBytes);
+    float delta[640];
+    for (int b = 0; b < 20; ++b) {
+        const uint8_t* block = primary + 34 * b; // Q8_0: one fp16 scale and 32 signed codes
+        uint16_t bits;
+        std::memcpy(&bits, block, sizeof(bits));
+        const float scale = f32_from_f16(bits);
+        for (int j = 0; j < 32; ++j)
+            delta[b * 32 + j] = hidden[b * 32 + j] - scale * static_cast<int8_t>(block[2 + j]);
+    }
+    native_pack_hidden(f, delta, hidden);
+}
+
+void add_residual_rows(const NativeFmt& f, const ExpertJobMulti& job, const float (*hidden)[FF],
+                       int r0, int r1, NativeArithmetic arithmetic) {
+    if (!residual_for(f)) return;
+    alignas(64) thread_local float parts[MAXT][2560];
+    float* rows[MAXT];
+    const void* residual[MAXT];
+    for (int t = 0; t < job.nt; ++t) {
+        rows[t] = parts[t];
+        residual[t] = hidden[t];
+    }
+    if (arithmetic == NativeArithmetic::WindowInvariant)
+        native_down_rows_invariant(f, job.blob, residual, job.nt, rows, r0, r1);
+    else
+        native_down_rows(f, job.blob, residual, job.nt, rows, r0, r1);
+    for (int t = 0; t < job.nt; ++t)
+        for (int r = r0; r < r1; ++r) job.out[t][r] += rows[t][r];
+}
+} // namespace
+
 void ExpertPool::native_rows(int e, int r0, int r1) {
     // the native row phases' work for expert `e` of the batch, rows [r0, r1) of its gate/up (mode 5) or down (mode 6)
     SplitBufMulti& sb = split_multi_[(size_t) e];
@@ -1321,6 +1366,8 @@ void ExpertPool::native_rows(int e, int r0, int r1) {
         else
             native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
     }
+    if (mode_ == 6)
+        add_residual_rows(*nfmt, mjobs_[e], sb.ff, r0, r1, narithmetic_);
 }
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
@@ -1450,7 +1497,7 @@ void ExpertPool::dep_task(int i) {
     int expect = 0;
     SplitBufMulti& sb = split_multi_[(size_t) e];
     if (d.quant.compare_exchange_strong(expect, 1, std::memory_order_acquire)) {
-        for (int t = 0; t < mjobs_[e].nt; ++t) native_quant_h(f, sb.ff[t], sb.hq[t]);
+        for (int t = 0; t < mjobs_[e].nt; ++t) quantize_pool_hidden(f, sb.ff[t], sb.hq[t]);
 #if defined(STRATA_Q81_GU_ALIGN_BUILT)
         prepare_batch_down(e); // visible together with hq after quant.store(release)
 #endif
@@ -1465,13 +1512,16 @@ void ExpertPool::dep_task(int i) {
     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
 #if defined(STRATA_Q81_GU_ALIGN_BUILT)
     if (d.prepared && d.prepared->ready &&
-        native_down_prepared_rows(*nfmt, mjobs_[e].blob, *d.prepared, mjobs_[e].nt, mjobs_[e].out, r0, r1))
+        native_down_prepared_rows(*nfmt, mjobs_[e].blob, *d.prepared, mjobs_[e].nt, mjobs_[e].out, r0, r1)) {
+        add_residual_rows(*nfmt, mjobs_[e], sb.ff, r0, r1, narithmetic_);
         return;
+    }
 #endif
     if (narithmetic_ == NativeArithmetic::WindowInvariant)
         native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
     else
         native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    add_residual_rows(*nfmt, mjobs_[e], sb.ff, r0, r1, narithmetic_);
 }
 
 #if defined(STRATA_Q81_GU_ALIGN_BUILT)
@@ -1629,7 +1679,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
                 if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+                else quantize_pool_hidden(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
 #if defined(STRATA_Q81_GU_ALIGN_BUILT)
         for (int e = 0; e < nb; ++e) prepare_batch_down(e);
 #endif

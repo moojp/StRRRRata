@@ -17,3 +17,9 @@ Set these values in the engine's `env` for the combined experiment:
 | `STRATA_CPU_DOWN_BATCH_REUSE` | `1` | Prepare down activations once per expert batch and publish them to the pool workers. |
 
 This is a numerical comparison with a GPU reference. The exp2 approximation can still differ from the GPU intrinsic, and closer expert outputs do not guarantee better answers. Recheck numerical accuracy, serving speed, and answer quality on the revision and model being deployed.
+
+### IQ4_NL hidden residual
+
+Set `STRATA_IQ4NL_H_RESIDUAL=1` in the engine environment to enable a second IQ4_NL down projection on the supported 2560 × 640 paths. It quantizes the difference between the original hidden activations and their first quantized representation, projects it with the same weights, and adds the two outputs. Input scales keep their existing rounding. The extra projection costs compute and the gfx12 fused prompt path also needs a temporary buffer. The switch defaults to off.
+
+The GSQ path uses this correction in the native CPU expert pool, GPU grouped experts, and gfx12 fused prompt experts with supported IQ gate/up weights. Restart the engine after changing the switch.

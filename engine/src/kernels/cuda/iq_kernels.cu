@@ -4,6 +4,7 @@
 // (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
+#include "strata/kernels/iq4nl_hidden_residual.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/nvfp4_decode_sm120.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -3112,6 +3113,43 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
         const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
 #endif
         q8_1_store(h, hq, i);
+    }
+}
+
+
+// The first group may start at a nonzero offset. A warp packs one Q8_1 block.
+__global__ void residual_hq_kernel(const float* gate, const float* up, const int32_t* starts, const int32_t* groups,
+                                   block_q8_1* primary, block_q8_1* residual) {
+    const long long begin = (long long) starts[0] * 640;
+    const long long end = (long long) starts[*groups] * 640;
+    for (long long i = begin + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < end;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float g = gate[i];
+        const float hidden = (g / (1.f + __expf(-g))) * up[i];
+        float peak = fabsf(hidden);
+        for (int k = 16; k; k >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, k));
+        const float scale = q8_1_finite(peak / 127.f);
+        const int code = q8_1_quant(hidden, scale, peak);
+        const float delta = hidden - __half2float(__float2half(scale)) * code;
+        q8_1_store(hidden, primary, i);
+        q8_1_store(delta, residual, i);
+    }
+}
+
+__global__ void residual_down_kernel(const unsigned long long* pointers, const int32_t* starts, const int32_t* groups,
+                                     const int32_t* dst, const block_q8_1* primary, const block_q8_1* residual,
+                                     NativeExpertLayout layout, float* out) {
+    const int row = blockIdx.x * 32 + threadIdx.x / 8;
+    const int lane = threadIdx.x % 8;
+    for (int g = blockIdx.y; g < *groups; g += gridDim.y) {
+        const auto* weight = (const uint8_t*) pointers[g] + layout.down_off + row * layout.d_row;
+        for (int e = starts[g]; e < starts[g + 1]; ++e) {
+            int offset[1] = {0};
+            float base[1], correction[1];
+            row_dot_sub8<20, 1, true>(weight, primary + 20 * e, offset, 1, lane, base);
+            row_dot_sub8<20, 1, true>(weight, residual + 20 * e, offset, 1, lane, correction);
+            if (lane == 0) out[(size_t) dst[e] * 2560 + row] = base[0] + correction[0];
+        }
     }
 }
 
@@ -7119,7 +7157,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // STRATA_EXPERT_NIBBLE (nib_layout): only the gate/up step below takes another kernel (launch_gu_nib, in place of
     // launch_gu); SwiGLU, the q8_1 quantization and the down rows (GGUF, at L.down_off) are the layout's own
     static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
-    if (v2 && !nib_layout(L) && L.had_block == 0 && L.tail_off == 0 && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
+    const bool residual_path = iq4nl_hidden_residual_enabled() && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640 &&
+                               !L.tail_off && !L.had_block && !nib_layout(L) && !g_exp_phase;
+    if (!residual_path && v2 && !nib_layout(L) && L.had_block == 0 && L.tail_off == 0 && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
         // S26 STRATA_TSUM=1: the sums as one transposed butterfly per warp (s26_tsum.cuh; bitwise the same values)
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         // (+ down rows' items spread evenly over the lanes, one load group: bitwise, harness 1.09-1.12x vs 1.03-1.06x;
@@ -7203,7 +7243,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && L.had_block == 0 && em0 == 8 && L.n_embd <= 4096 &&
+    const bool fused_gu = !residual_path && !nib_layout(L) && L.had_block == 0 && em0 == 8 && L.n_embd <= 4096 &&
                           ((kExpLds16 && L.gu_type == 16) || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 20 ||
                            L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23 || L.gu_type == 29 || L.gu_type == 42 ||
                            L.gu_type == 8 || L.gu_type == 10 || L.gu_type == 11 || L.gu_type == 12 || L.gu_type == 13 ||
@@ -7245,7 +7285,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool gs_layout = true;
 #endif
-    if (gs_layout && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
+    if (!residual_path && gs_layout && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
         switch (L.gu_type) {
 #define STRATA_GS(T) case T: gs_done = launch_gu_swiglu<T>(L, gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
             STRATA_GU_FMTS(STRATA_GS)
@@ -7325,6 +7365,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
+    if (residual_path) {
+        static const bool noted=[] { std::fprintf(stderr,"IQ4NL residual active: GPU grouped\n"); return true; }(); (void)noted;
+        auto* extra=reinterpret_cast<block_q8_1*>(h);
+        residual_hq_kernel<<<(unsigned)((nh+255)/256),256,0,s>>>(gate,up,grp_start,n_groups,hq,extra);
+        residual_down_kernel<<<dim3(80,(unsigned)gy),256,0,s>>>(grp_ptr,grp_start,n_groups,ent_dst,hq,extra,L,out);
+        check("IQ4NL residual grouped"); return;
+    }
     if (sw_v1 || L.had_block > 0) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)

@@ -19,6 +19,7 @@
 // to 8 KB, IQ2_S).  The activations arrive by cp.async, four stages deep, as in moe_fused.cu; the fragments come by
 // ldmatrix.  The products are mma.sync m16n8k32 (m16n8k16 for the formats with a scale per 16 values); the epilogues
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
+#include "strata/kernels/iq4nl_hidden_residual.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/nvfp4_prefill_mode.hpp"
@@ -1830,10 +1831,10 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
 // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap)
 // where nw_capped(WT) says the cap applies.
 // Disable both with -DSTRATA_W_NO_OCC (the launch sites then use <WT, GU, false, 0> and grid factor wgp_blocks).
-template <int WT, bool GU, bool ALIAS = false, int LB = 0>
+template <int WT, bool GU, bool ALIAS = false, int LB = 0, bool RESIDUAL = false>
 __global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 && nw_capped(WT) ? LB : 1)))
 native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
-                  const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
+                  const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm, uint8_t* __restrict__ extra = nullptr) {
 #if STRATA_NAT_WMMA
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;  // 64-value stages along K
     constexpr int NFB = (GU ? GU_ROWS_N : D_ROWS_N) / NW_ROWS;     // work items per tile
@@ -2071,7 +2072,25 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                     o4[0] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
                     o4[1] = make_uint4(wd[4], wd[5], wd[6], wd[7]);
                     *reinterpret_cast<float*>(o + 64 + 4 * hh) = am / 127.0f;
-                    *reinterpret_cast<float*>(o + 72 + 4 * hh) = (float) csum;   // (the formats with a minimum)
+                    *reinterpret_cast<float*>(o + 72 + 4 * hh) = (float) csum;
+                    if constexpr (RESIDUAL) {
+                        uint8_t* residual_block = extra + (o - out);
+                        float delta[32], peak = 0.f;
+                        for (int j = 0; j < 32; ++j) {
+                            const int code = (int8_t) (wd[j >> 2] >> (8 * (j & 3)));
+                            delta[j] = hs[r][32 * hh + j] - (am / 127.f) * code;
+                            peak = fmaxf(peak, fabsf(delta[j]));
+                        }
+                        const float inv_delta = peak > 0 ? 127.f / peak : 0.f;
+                        int sum = 0;
+                        for (int j = 0; j < 32; ++j) {
+                            const int code = __float2int_rn(delta[j] * inv_delta);
+                            residual_block[32 * hh + j] = (uint8_t) (int8_t) code;
+                            sum += code;
+                        }
+                        *reinterpret_cast<float*>(residual_block + 64 + 4 * hh) = peak / 127.f;
+                        *reinterpret_cast<float*>(residual_block + 72 + 4 * hh) = (float) sum;
+                    }
                 }
             }
         } else {
@@ -2085,6 +2104,11 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 #if STRATA_NAT_W12
                             // columns rbase + 32 wm + 16 mt + 8 hi .. + 7: contiguous, 32-byte aligned (dm: 16, checked in experts_native)
                             float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * kMoeEmbd + rbase + 32 * wm + 16 * mt + 8 * hi);
+                            if constexpr (RESIDUAL) {
+                                float4 u=d[0], v=d[1];
+                                acc[mt][nt][0]+=u.x;acc[mt][nt][1]+=u.y;acc[mt][nt][2]+=u.z;acc[mt][nt][3]+=u.w;
+                                acc[mt][nt][4]+=v.x;acc[mt][nt][5]+=v.y;acc[mt][nt][6]+=v.z;acc[mt][nt][7]+=v.w;
+                            }
                             d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
                             d[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
 #else
@@ -3777,7 +3801,12 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
                                                           (int64_t) d.sms * (occ_d ? occ_blocks(d.w12, g.d_type, false) : wgp_blocks(d.occ)));
         const uint8_t* xa8 = (const uint8_t*) xa;
         uint8_t* ha8 = (uint8_t*) ha;
-#define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
+        uint8_t* extra=nullptr;
+        if (strata::kernels::iq4nl_hidden_residual_enabled() && d.w12 && kMoeEmbd==2560 && kMoeFF==640 && g.d_type==T_IQ4_NL && !g_rot_on && (g.gu_type==T_IQ3_XXS || g.gu_type==T_IQ3_S || g.gu_type==T_IQ2_S || g.gu_type==T_IQ4_XS)) {
+            static const bool note=[] {std::fprintf(stderr,"IQ4NL residual active: GPU prefill\n");return true;}(); (void)note;
+            ck(hipMallocAsync((void**)&extra,(size_t)n*H_ROW_BYTES,s),"prefill residual workspace");
+        }
+#define STRATA_NW_GU(T) do { if(extra && occ_gu) native_w11_kernel<T,true,true,NW_LB,true><<<g_gu,NW_THREADS,0,s>>>(b,g,tb,xa8,src,ha8,nullptr,extra); else if(extra) native_w11_kernel<T,true,false,0,true><<<g_gu,NW_THREADS,0,s>>>(b,g,tb,xa8,src,ha8,nullptr,extra); else if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
         // STRATA_PF_F16=1: gfx11's F16 matrix cores - the K-quants' kernels (moe_f16_kq.cu) and native_f16_kernel for
         // f16_gu / f16_d (gfx12's WMMA layout differs, so it keeps the int8 kernels)
         const bool f16 = !d.w12 && f16::requested();
@@ -3847,6 +3876,11 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         else if (g.d_type == T_Q5_1) STRATA_NW_D(T_Q5_1);
         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);
         else STRATA_NW_D(T_IQ4_NL);
+        if (extra) {
+            if(occ_d) native_w11_kernel<T_IQ4_NL,false,true,NW_LB,true><<<g_d,NW_THREADS,0,s>>>(b,g,tb,extra,src,nullptr,dm);
+            else native_w11_kernel<T_IQ4_NL,false,false,0,true><<<g_d,NW_THREADS,0,s>>>(b,g,tb,extra,src,nullptr,dm);
+            ck(hipFreeAsync(extra,s),"prefill residual workspace release");
+        }
 #undef STRATA_NW_D
 #undef STRATA_F16_LAUNCH
         ck(cudaGetLastError(), "experts_native");

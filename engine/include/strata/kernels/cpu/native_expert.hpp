@@ -67,6 +67,8 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
+// Pack values already in down-projection coordinates, without recording a second hidden activation.
+void native_pack_hidden(const NativeFmt& f, const float* h, void* dst);
 
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
 /// below that).  1: a token's rows are the same alone and in any group.

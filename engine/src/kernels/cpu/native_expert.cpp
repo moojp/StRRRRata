@@ -599,14 +599,7 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     traits(f.gu_act).from_float(x, dst, f.n_embd);
 }
 
-void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
-    if (f.had_d) {
-        thread_local std::vector<float> tmp;
-        tmp.assign(h, h + f.n_ff);
-        hadamard_rotate(tmp.data(), (int) f.n_ff, f.had_block, f.d_signs);
-        h = tmp.data();
-    }
-    if (act_dump().on) act_dump_record(f.layer, 1, h, f.n_ff);
+void native_pack_hidden(const NativeFmt& f, const float* h, void* dst) {
 #if defined(STRATA_Q81_GU_ALIGN_BUILT)
     if (iq4nl_hidden_round_requested() && f.d_type == 20 && f.d_act == kTQ8_0 &&
         f.n_ff == 640 && !f.had_d && !f.tail_off && iq4nl_gpu_hidden_quant(h, dst))
@@ -615,6 +608,17 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     if (q8k_avx1(f.d_act)) { q8k_quant_avx1(h, dst, f.n_ff); return; }
     traits(f.d_act).from_float(h, dst, f.n_ff);
+}
+
+void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.had_d) {
+        thread_local std::vector<float> tmp;
+        tmp.assign(h, h + f.n_ff);
+        hadamard_rotate(tmp.data(), (int) f.n_ff, f.had_block, f.d_signs);
+        h = tmp.data();
+    }
+    if (act_dump().on) act_dump_record(f.layer, 1, h, f.n_ff);
+    native_pack_hidden(f, h, dst);
 }
 
 int native_gu_mt_min(int gu_type) {
