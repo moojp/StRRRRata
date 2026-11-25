@@ -11,6 +11,7 @@ Set these values in the engine's `env` for the combined experiment:
 | `STRATA_CPU_Q81_GU_ALIGN` | `1` | Use GPU-style Q8_1 activation blocks and accumulation order for supported IQ gate/up rows. |
 | `STRATA_CPU_GPU_SILU_EXP2` | `1` | Use an exp2-based CPU SwiGLU approximation in the aligned gate/up path. |
 | `STRATA_CPU_Q81_Q2_DOWN_SCALE` | `1` | Round the activation scales of the 640-wide Q2_0 down path to FP16. |
+| `STRATA_CPU_IQ4NL_HIDDEN_ROUND` | `1` | Match GPU rounding when packing the 640 hidden activations for IQ4_NL down rows. |
 | `STRATA_CPU_Q81_DOWN_ORDER` | `1` | Use GPU-style accumulation order for supported IQ4_NL down rows. |
 | `STRATA_CPU_DOWN_REUSE` | `1` | Reuse decoded values in supported IQ4_NL down batches. The GPU-order path takes precedence when eligible. |
 | `STRATA_CPU_DOWN_BATCH_REUSE` | `1` | Prepare down activations once per expert batch and publish them to the pool workers. |

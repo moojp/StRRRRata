@@ -49,6 +49,18 @@ bool q81_gu_requested(){
         return true;
     }();return on;
 }
+bool iq4nl_hidden_round_requested() {
+    static const bool on = [] {
+        const char* value = std::getenv("STRATA_CPU_IQ4NL_HIDDEN_ROUND");
+        if (!value || !*value || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") != 0)
+            throw std::runtime_error("STRATA_CPU_IQ4NL_HIDDEN_ROUND expects 0 or 1");
+        if (!cpu_avx2_ok())
+            throw std::runtime_error("STRATA_CPU_IQ4NL_HIDDEN_ROUND requires AVX2/FMA/F16C");
+        return true;
+    }();
+    return on;
+}
 bool q81_gu_for(const NativeFmt& f){
     return q81_gu_requested()&&f.n_embd==2560&&f.n_ff==640&&!f.had_gu&&!f.had_d&&f.act_bytes>=2919&&
         (f.gu_type==18||f.gu_type==21||f.gu_type==22||f.gu_type==23);
@@ -417,6 +429,7 @@ bool kq512_ok(int type) {
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
 #if defined(STRATA_Q81_GU_ALIGN_BUILT)
     (void)q81_gu_requested();   // validate opt-in setting before accepting requests
+    (void)iq4nl_hidden_round_requested();
     (void)q81_down_order_requested();
     (void)q81_down_requested();
 #endif
@@ -594,6 +607,11 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
         h = tmp.data();
     }
     if (act_dump().on) act_dump_record(f.layer, 1, h, f.n_ff);
+#if defined(STRATA_Q81_GU_ALIGN_BUILT)
+    if (iq4nl_hidden_round_requested() && f.d_type == 20 && f.d_act == kTQ8_0 &&
+        f.n_ff == 640 && !f.had_d && !f.tail_off && iq4nl_gpu_hidden_quant(h, dst))
+        return;
+#endif
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     if (q8k_avx1(f.d_act)) { q8k_quant_avx1(h, dst, f.n_ff); return; }
     traits(f.d_act).from_float(h, dst, f.n_ff);

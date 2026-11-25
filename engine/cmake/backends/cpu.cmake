@@ -309,6 +309,7 @@ macro(strata_cpu_native_experts)
     set(_strata_alignment_avx2_sources
         src/kernels/cpu/gpu_down_order.cpp
         src/kernels/cpu/gu_consume.cpp
+        src/kernels/cpu/iq4nl_hidden_round.cpp
         src/kernels/cpu/q2_down_scales.cpp
         src/kernels/cpu/q81_gu_align.cpp)
     target_sources(strata_kernels_cpu PRIVATE ${_strata_alignment_avx2_sources})
@@ -408,6 +409,13 @@ macro(strata_cpu_native_experts)
   target_link_libraries(bwg_pool_bench PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     # a token's native expert rows are the same bits at every number of tokens that share its expert (window-invariant arithmetic)
+    if(STRATA_BUILD_CPU_EXPERT_ALIGNMENT)
+      add_executable(iq4nl_hidden_round_test src/kernels/cpu/iq4nl_hidden_round_test.cpp)
+      target_link_libraries(iq4nl_hidden_round_test PRIVATE strata_kernels_cpu)
+      add_test(NAME iq4nl_hidden_round COMMAND iq4nl_hidden_round_test)
+      set_tests_properties(iq4nl_hidden_round PROPERTIES
+          ENVIRONMENT "STRATA_CPU_IQ4NL_HIDDEN_ROUND=1" SKIP_RETURN_CODE 77)
+    endif()
     add_executable(native_arithmetic_parity src/kernels/cpu/native_arithmetic_parity.cpp)
     target_link_libraries(native_arithmetic_parity PRIVATE strata_kernels_cpu)
     add_test(NAME native_arithmetic_parity COMMAND native_arithmetic_parity)

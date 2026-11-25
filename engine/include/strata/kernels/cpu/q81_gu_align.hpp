@@ -4,6 +4,8 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 namespace strata::kernels::cpu {
 struct ActQ;
+// 640 hidden values, packed as 20 Q8_0 blocks. False requests a whole-buffer fallback.
+bool iq4nl_gpu_hidden_quant(const float* x, void* dst);
 //640-value Q2_0 down image only; caller checks opt-in and AVX2/F16C.
 void q81_q2_down_scales(ActQ& a);
 // These functions are AVX2/FMA/F16C code. Call only after a runtime ISA check.
